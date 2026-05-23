@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.DS_Store
+
+# Streamlit logs / temp files
+streamlit.*.log
+*.out.log
+*.err.log
+
+# GitHub
+.venv/
+
