@@ -204,6 +204,15 @@ class State(TypedDict):
 # 2) LLM
 # -----------------------------
 TEXT_MODEL_PROVIDER = os.getenv("TEXT_MODEL_PROVIDER", "auto").strip().lower()
+IMAGE_MODEL_PROVIDER = os.getenv("IMAGE_MODEL_PROVIDER", "auto").strip().lower()
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
+OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "AI Blog Agent")
+OWL_ALPHA_MODEL = os.getenv("OWL_ALPHA_MODEL", "openrouter/owl-alpha")
+GROK_MODEL = os.getenv("GROK_MODEL", os.getenv("XAI_MODEL", "grok-4.3"))
+GROK_BASE_URL = os.getenv("GROK_BASE_URL", os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")).rstrip("/")
+GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", os.getenv("XAI_GROK_IMAGE_MODEL", "x-ai/grok-imagine-image-quality"))
+XAI_IMAGE_MODEL = os.getenv("XAI_IMAGE_MODEL", "grok-imagine-image-quality")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 LOCAL_MODEL_NAME = os.getenv("LOCAL_MODEL_NAME", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -341,6 +350,146 @@ def _gemini_text(prompt: str) -> str:
     raise RuntimeError("Gemini API request failed. " + " | ".join(errors))
 
 
+def _env_first(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+def _looks_like_openrouter_key(api_key: str) -> bool:
+    return api_key.startswith("sk-or-")
+
+
+def _openrouter_extra_headers() -> dict:
+    headers = {"X-Title": OPENROUTER_APP_TITLE}
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    return headers
+
+
+def _openrouter_headers(api_key: str) -> dict:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        **_openrouter_extra_headers(),
+    }
+
+
+def _owl_alpha_api_key() -> Optional[str]:
+    return _env_first("OWL_ALPHA_API_KEY", "OPENROUTER_API_KEY", "Owl Alpha_API_KEY")
+
+
+def _owl_alpha_text(prompt: str) -> str:
+    api_key = _owl_alpha_api_key()
+    if not api_key:
+        raise RuntimeError("OWL_ALPHA_API_KEY or OPENROUTER_API_KEY is not set for Owl Alpha text generation.")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "Owl Alpha/OpenRouter support requires the openai package. Install it with pip install openai."
+        ) from exc
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers=_openrouter_extra_headers(),
+        timeout=90,
+        max_retries=2,
+    )
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 5):
+        try:
+            response = client.chat.completions.create(
+                model=OWL_ALPHA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=1200,
+            )
+            text = response.choices[0].message.content
+            if not text:
+                raise RuntimeError(f"Owl Alpha/OpenRouter response did not include text: {response}")
+            return text.strip()
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code and status_code not in {408, 409, 429} and status_code < 500:
+                raise
+            last_error = exc
+            if attempt < 4:
+                time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"Owl Alpha/OpenRouter request failed after retries: {last_error}")
+
+
+def _grok_api_key() -> Optional[str]:
+    return os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
+
+
+def _extract_openai_response_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if output_text:
+        return str(output_text).strip()
+
+    texts: List[str] = []
+    for output in getattr(response, "output", []) or []:
+        for content in getattr(output, "content", []) or []:
+            text = getattr(content, "text", None)
+            if text:
+                texts.append(str(text))
+    if texts:
+        return "\n".join(texts).strip()
+
+    raise RuntimeError(f"Model response did not include text: {response}")
+
+
+def _grok_text(prompt: str) -> str:
+    api_key = _grok_api_key()
+    if not api_key:
+        raise RuntimeError("GROK_API_KEY or XAI_API_KEY is not set for Grok text generation.")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "Grok support requires the openai package. Install it with pip install openai."
+        ) from exc
+
+    client = OpenAI(api_key=api_key, base_url=GROK_BASE_URL)
+    errors: List[str] = []
+
+    try:
+        response = client.responses.create(
+            model=GROK_MODEL,
+            input=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_output_tokens=1000,
+            store=False,
+        )
+        return _extract_openai_response_text(response)
+    except Exception as exc:
+        errors.append(f"responses API: {exc}")
+
+    try:
+        response = client.chat.completions.create(
+            model=GROK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=1000,
+        )
+        text = response.choices[0].message.content
+        if not text:
+            raise RuntimeError(f"Model response did not include text: {response}")
+        return text.strip()
+    except Exception as exc:
+        errors.append(f"chat completions API: {exc}")
+
+    raise RuntimeError("Grok API request failed. " + " | ".join(errors))
+
+
 def _openai_text(prompt: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -383,10 +532,18 @@ def _local_text(prompt: str) -> str:
 
 
 def _get_text_provider_order() -> List[str]:
+    if TEXT_MODEL_PROVIDER in ("owl", "owl-alpha", "owl_alpha", "openrouter", "openrouter_owl"):
+        return ["owl_alpha"]
+    if TEXT_MODEL_PROVIDER in ("grok", "xai"):
+        return ["grok"]
     if TEXT_MODEL_PROVIDER in ("gemini", "openai", "local"):
         return [TEXT_MODEL_PROVIDER]
 
     order: List[str] = []
+    if _owl_alpha_api_key():
+        order.append("owl_alpha")
+    if _grok_api_key():
+        order.append("grok")
     if os.getenv("GOOGLE_API_KEY"):
         order.append("gemini")
     if os.getenv("OPENAI_API_KEY"):
@@ -400,6 +557,10 @@ def run_text_model(prompt: str) -> str:
     errors: List[str] = []
     for provider in _get_text_provider_order():
         try:
+            if provider == "owl_alpha":
+                return _owl_alpha_text(prompt)
+            if provider == "grok":
+                return _grok_text(prompt)
             if provider == "gemini":
                 return _gemini_text(prompt)
             if provider == "openai":
@@ -725,8 +886,73 @@ Rules:
 - Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
 - If no images needed: md_with_placeholders must equal input and images=[].
 - Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
+- Every image object must include placeholder, filename, alt, caption, prompt, size, and quality.
+- Use size values only from: 1024x1024, 1024x1536, 1536x1024.
+- Use quality values only from: low, medium, high.
+Return strictly this JSON shape:
+{"md_with_placeholders":"...","images":[{"placeholder":"[[IMAGE_1]]","filename":"diagram_name.png","alt":"Short alt text","caption":"Short caption","prompt":"Detailed image prompt","size":"1024x1024","quality":"medium"}]}
 """
+
+
+def _normalize_image_plan_dict(raw: object, merged_md: str) -> dict:
+    if not isinstance(raw, dict):
+        return {"md_with_placeholders": merged_md, "images": []}
+
+    md = raw.get("md_with_placeholders") or raw.get("markdown") or raw.get("content") or merged_md
+    md = str(md)
+
+    raw_images = raw.get("images") or []
+    if not isinstance(raw_images, list):
+        raw_images = []
+
+    images: List[dict] = []
+    for index, item in enumerate(raw_images[:3], start=1):
+        if not isinstance(item, dict):
+            continue
+
+        prompt = str(item.get("prompt") or item.get("description") or item.get("title") or "").strip()
+        if not prompt:
+            continue
+
+        title = str(
+            item.get("title")
+            or item.get("caption")
+            or item.get("alt")
+            or f"Image {index}"
+        ).strip()
+        placeholder = str(item.get("placeholder") or f"[[IMAGE_{index}]]").strip()
+        if not re.fullmatch(r"\[\[IMAGE_[1-3]\]\]", placeholder):
+            placeholder = f"[[IMAGE_{index}]]"
+
+        filename = str(item.get("filename") or f"{_safe_slug(title)}.png").strip()
+        if not re.search(r"\.(png|jpg|jpeg|webp)$", filename, flags=re.IGNORECASE):
+            filename = f"{_safe_slug(filename)}.png"
+
+        size = str(item.get("size") or "1024x1024")
+        if size not in {"1024x1024", "1024x1536", "1536x1024"}:
+            size = "1024x1024"
+
+        quality = str(item.get("quality") or "medium").lower()
+        if quality not in {"low", "medium", "high"}:
+            quality = "medium"
+
+        if placeholder not in md:
+            md = f"{md.rstrip()}\n\n{placeholder}\n"
+
+        images.append(
+            {
+                "placeholder": placeholder,
+                "filename": filename,
+                "alt": str(item.get("alt") or title).strip(),
+                "caption": str(item.get("caption") or title).strip(),
+                "prompt": prompt,
+                "size": size,
+                "quality": quality,
+            }
+        )
+
+    return {"md_with_placeholders": md, "images": images}
+
 
 def decide_images(state: State) -> dict:
     merged_md = state["merged_md"]
@@ -741,12 +967,168 @@ def decide_images(state: State) -> dict:
         f"{merged_md}"
         "\nReturn only valid JSON matching the GlobalImagePlan schema."
     )
-    image_plan = GlobalImagePlan(**_parse_json(run_text_model(prompt)))
+    image_plan_data = _normalize_image_plan_dict(_parse_json(run_text_model(prompt)), merged_md)
+    image_plan = GlobalImagePlan(**image_plan_data)
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
         "image_specs": [img.model_dump() for img in image_plan.images],
     }
+
+
+def _grok_generate_image_bytes(prompt: str) -> bytes:
+    api_key = _grok_api_key()
+    if not api_key:
+        raise RuntimeError("GROK_API_KEY or XAI_API_KEY is not set for Grok image generation.")
+
+    try:
+        from openai import OpenAI
+        import requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "Grok image generation requires the openai and requests packages."
+        ) from exc
+
+    client = OpenAI(api_key=api_key, base_url=GROK_BASE_URL)
+    image_response = client.images.generate(
+        model=XAI_IMAGE_MODEL,
+        prompt=prompt,
+    )
+
+    data = getattr(image_response, "data", None)
+    if not data:
+        raise RuntimeError("Grok image generation returned no data.")
+
+    image_data = data[0]
+    if isinstance(image_data, dict):
+        b64_json = image_data.get("b64_json")
+        image_url = image_data.get("url")
+    else:
+        b64_json = getattr(image_data, "b64_json", None)
+        image_url = getattr(image_data, "url", None)
+
+    if b64_json:
+        return base64.b64decode(b64_json)
+
+    if image_url:
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        return response.content
+
+    raise RuntimeError("Grok image generation returned neither base64 data nor a URL.")
+
+
+def _openrouter_grok_image_api_key() -> Optional[str]:
+    explicit_key = _env_first("XAI_GROK_API_KEY", "xAI_GROK_API_KEY", "GROK_IMAGE_API_KEY")
+    if explicit_key:
+        return explicit_key
+
+    grok_key = _grok_api_key()
+    if grok_key and _looks_like_openrouter_key(grok_key):
+        return grok_key
+    return None
+
+
+def _decode_image_url_to_bytes(url: str) -> bytes:
+    if url.startswith("data:image/") and "," in url:
+        _, encoded = url.split(",", 1)
+        return base64.b64decode(encoded)
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "Downloading remote image URLs requires the requests package."
+        ) from exc
+
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response.content
+
+
+def _extract_openrouter_image_bytes(data: dict) -> bytes:
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"OpenRouter image response did not include choices: {data}")
+
+    message = choices[0].get("message") or {}
+    images = message.get("images") or []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        image_url = image.get("image_url") or {}
+        if isinstance(image_url, dict) and image_url.get("url"):
+            return _decode_image_url_to_bytes(str(image_url["url"]))
+
+    content = message.get("content")
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            image_url = part.get("image_url") or {}
+            if isinstance(image_url, dict) and image_url.get("url"):
+                return _decode_image_url_to_bytes(str(image_url["url"]))
+
+    raise RuntimeError(f"OpenRouter image response did not include generated image data: {data}")
+
+
+def _openrouter_grok_generate_image_bytes(prompt: str) -> bytes:
+    api_key = _openrouter_grok_image_api_key()
+    if not api_key:
+        raise RuntimeError("XAI_GROK_API_KEY or GROK_IMAGE_API_KEY is not set for OpenRouter Grok image generation.")
+
+    try:
+        import requests
+    except ImportError as exc:
+        raise RuntimeError(
+            "OpenRouter Grok image generation requires the requests package."
+        ) from exc
+
+    url = f"{OPENROUTER_BASE_URL}/chat/completions"
+    errors: List[str] = []
+    for modalities in (["image"], ["image", "text"]):
+        payload = {
+            "model": GROK_IMAGE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": modalities,
+            "stream": False,
+        }
+        try:
+            response = requests.post(
+                url,
+                headers=_openrouter_headers(api_key),
+                json=payload,
+                timeout=180,
+            )
+            response.raise_for_status()
+            return _extract_openrouter_image_bytes(response.json())
+        except requests.HTTPError as exc:
+            response_text = getattr(exc.response, "text", "") if exc.response is not None else ""
+            errors.append(f"modalities={modalities}: HTTP {response.status_code} from OpenRouter image API. {response_text[:500]}")
+        except Exception as exc:
+            errors.append(f"modalities={modalities}: {exc}")
+
+    raise RuntimeError("OpenRouter Grok image generation failed. " + " | ".join(errors))
+
+
+def _get_image_provider_order() -> List[str]:
+    if IMAGE_MODEL_PROVIDER in ("grok", "grok_openrouter", "openrouter_grok", "xai_grok"):
+        return ["grok_openrouter"]
+    if IMAGE_MODEL_PROVIDER in ("xai", "xai_official"):
+        return ["xai"]
+    if IMAGE_MODEL_PROVIDER in ("gemini", "openai"):
+        return [IMAGE_MODEL_PROVIDER]
+
+    order: List[str] = []
+    if _openrouter_grok_image_api_key():
+        order.append("grok_openrouter")
+    if _grok_api_key() and not _looks_like_openrouter_key(_grok_api_key() or ""):
+        order.append("xai")
+    if os.getenv("GOOGLE_API_KEY"):
+        order.append("gemini")
+    if os.getenv("OPENAI_API_KEY"):
+        order.append("openai")
+    return order
 
 
 def _gemini_generate_image_bytes(prompt: str) -> bytes:
@@ -826,16 +1208,22 @@ def _openai_generate_image_bytes(prompt: str) -> bytes:
 
 def _generate_image_bytes(prompt: str) -> bytes:
     errors: List[str] = []
-    try:
-        return _gemini_generate_image_bytes(prompt)
-    except Exception as exc:
-        errors.append(f"gemini: {exc}")
 
-    if os.getenv("OPENAI_API_KEY"):
+    for provider in _get_image_provider_order():
         try:
-            return _openai_generate_image_bytes(prompt)
+            if provider == "grok_openrouter":
+                return _openrouter_grok_generate_image_bytes(prompt)
+            if provider == "xai":
+                return _grok_generate_image_bytes(prompt)
+            if provider == "gemini":
+                return _gemini_generate_image_bytes(prompt)
+            if provider == "openai":
+                return _openai_generate_image_bytes(prompt)
         except Exception as exc:
-            errors.append(f"openai: {exc}")
+            errors.append(f"{provider}: {exc}")
+
+    if not errors:
+        errors.append("no image provider key is configured")
 
     raise RuntimeError("Image generation failed. " + " | ".join(errors))
 
@@ -860,34 +1248,33 @@ def generate_and_place_images(state: State) -> dict:
         Path(filename).write_text(md, encoding="utf-8")
         return {"final": md}
 
-    images_dir = Path("images")
+    blog_slug = _safe_slug(plan.blog_title)
+    images_dir = Path("images") / blog_slug
     images_dir.mkdir(exist_ok=True)
 
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
+        filename = Path(spec["filename"]).name
         out_path = images_dir / filename
 
-        # generate only if needed
-        if not out_path.exists():
-            try:
-                img_bytes = _generate_image_bytes(spec["prompt"])
-                out_path.write_bytes(img_bytes)
-            except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
-                )
-                md = md.replace(placeholder, prompt_block)
-                continue
+        try:
+            img_bytes = _generate_image_bytes(spec["prompt"])
+            out_path.write_bytes(img_bytes)
+        except Exception as e:
+            # graceful fallback: keep doc usable
+            prompt_block = (
+                f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
+                f"> **Alt:** {spec.get('alt','')}\n>\n"
+                f"> **Prompt:** {spec.get('prompt','')}\n>\n"
+                f"> **Error:** {e}\n"
+            )
+            md = md.replace(placeholder, prompt_block)
+            continue
 
-        img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
+        img_md = f"![{spec['alt']}](images/{blog_slug}/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
 
-    filename = f"{_safe_slug(plan.blog_title)}.md"
+    filename = f"{blog_slug}.md"
     Path(filename).write_text(md, encoding="utf-8")
     return {"final": md}
 

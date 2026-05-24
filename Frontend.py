@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import textwrap
 import zipfile
 from datetime import date
 from io import BytesIO
@@ -11,6 +12,7 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 
 import pandas as pd
 import streamlit as st
+from PIL import Image, ImageDraw, ImageFont
 
 # -----------------------------
 # Import your compiled LangGraph app lazily (avoid import-time side effects)
@@ -60,6 +62,175 @@ def images_zip(images_dir: Path) -> Optional[bytes]:
     return buf.getvalue()
 
 
+def _load_font(size: int, bold: bool = False, mono: bool = False):
+    candidates = []
+    if mono:
+        candidates.extend(["consola.ttf", "DejaVuSansMono.ttf", "C:/Windows/Fonts/consola.ttf"])
+    elif bold:
+        candidates.extend(["arialbd.ttf", "DejaVuSans-Bold.ttf", "C:/Windows/Fonts/arialbd.ttf"])
+    else:
+        candidates.extend(["arial.ttf", "DejaVuSans.ttf", "C:/Windows/Fonts/arial.ttf"])
+
+    for font_name in candidates:
+        try:
+            return ImageFont.truetype(font_name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _clean_markdown_text(text: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", text)
+    text = re.sub(r"[*_`]+", "", text)
+    return text.strip()
+
+
+def _wrap_text_px(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> List[str]:
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+        current = word
+
+        while draw.textlength(current, font=font) > max_width and len(current) > 1:
+            split_at = max(1, len(current) - 1)
+            while split_at > 1 and draw.textlength(current[:split_at], font=font) > max_width:
+                split_at -= 1
+            lines.append(current[:split_at])
+            current = current[split_at:]
+
+    if current:
+        lines.append(current)
+    return lines
+
+
+def markdown_to_pdf_bytes(md: str) -> bytes:
+    page_width, page_height = 1240, 1754  # A4-ish at 150 DPI
+    margin = 90
+    max_width = page_width - (margin * 2)
+    bg = "white"
+    text_color = "#111827"
+    muted_color = "#4b5563"
+    code_bg = "#f3f4f6"
+
+    body_font = _load_font(28)
+    bold_font = _load_font(30, bold=True)
+    h1_font = _load_font(48, bold=True)
+    h2_font = _load_font(38, bold=True)
+    h3_font = _load_font(32, bold=True)
+    code_font = _load_font(24, mono=True)
+
+    pages: List[Image.Image] = []
+
+    def new_page():
+        page = Image.new("RGB", (page_width, page_height), bg)
+        pages.append(page)
+        return page, ImageDraw.Draw(page), margin
+
+    page, draw, y = new_page()
+
+    def ensure_space(required: int):
+        nonlocal page, draw, y
+        if y + required <= page_height - margin:
+            return
+        page, draw, y = new_page()
+
+    def draw_wrapped(text: str, font, color=text_color, indent: int = 0, spacing: int = 10):
+        nonlocal y
+        text = _clean_markdown_text(text)
+        if not text:
+            y += 18
+            return
+        lines = _wrap_text_px(draw, text, font, max_width - indent)
+        line_height = int(font.size * 1.35) if hasattr(font, "size") else 36
+        ensure_space((line_height * len(lines)) + spacing)
+        for line in lines:
+            draw.text((margin + indent, y), line, font=font, fill=color)
+            y += line_height
+        y += spacing
+
+    def draw_local_image(src: str):
+        nonlocal y
+        img_path = _resolve_image_path(src)
+        if not img_path.exists():
+            draw_wrapped(f"[Image not found: {src}]", body_font, muted_color)
+            return
+        try:
+            with Image.open(img_path) as img:
+                img = img.convert("RGB")
+                scale = min(max_width / img.width, 520 / img.height, 1)
+                size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+                ensure_space(size[1] + 30)
+                img = img.resize(size)
+                x = margin + ((max_width - size[0]) // 2)
+                page.paste(img, (x, y))
+                y += size[1] + 24
+        except Exception as exc:
+            draw_wrapped(f"[Image could not be rendered: {src} ({exc})]", body_font, muted_color)
+
+    in_code = False
+    lines = md.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            in_code = not in_code
+            y += 12
+            i += 1
+            continue
+
+        image_match = _MD_IMG_RE.fullmatch(stripped)
+        if image_match:
+            draw_local_image(image_match.group("src").strip())
+            i += 1
+            continue
+
+        caption_match = _CAPTION_LINE_RE.match(stripped)
+        if caption_match:
+            draw_wrapped(caption_match.group("cap"), body_font, muted_color, spacing=18)
+            i += 1
+            continue
+
+        if not stripped:
+            y += 18
+            i += 1
+            continue
+
+        if in_code:
+            ensure_space(42)
+            draw.rectangle((margin - 12, y - 6, page_width - margin + 12, y + 36), fill=code_bg)
+            draw.text((margin, y), line[:110], font=code_font, fill=text_color)
+            y += 42
+        elif stripped.startswith("# "):
+            draw_wrapped(stripped[2:], h1_font, spacing=28)
+        elif stripped.startswith("## "):
+            draw_wrapped(stripped[3:], h2_font, spacing=22)
+        elif stripped.startswith("### "):
+            draw_wrapped(stripped[4:], h3_font, spacing=18)
+        elif stripped.startswith(("- ", "* ")):
+            draw_wrapped("• " + stripped[2:], body_font, indent=24)
+        elif re.match(r"^\d+\.\s+", stripped):
+            draw_wrapped(stripped, body_font, indent=24)
+        else:
+            draw_wrapped(stripped, body_font)
+        i += 1
+
+    buf = BytesIO()
+    pages[0].save(buf, format="PDF", save_all=True, append_images=pages[1:], resolution=150)
+    return buf.getvalue()
+
+
 def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     Stream graph progress.
@@ -95,9 +266,33 @@ _MD_IMG_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 _CAPTION_LINE_RE = re.compile(r"^\*(?P<cap>.+)\*$")
 
 
+def image_paths_from_markdown(md: str) -> List[Path]:
+    paths: List[Path] = []
+    seen = set()
+    for match in _MD_IMG_RE.finditer(md):
+        src = (match.group("src") or "").strip()
+        if src.startswith("http://") or src.startswith("https://") or src.startswith("data:"):
+            continue
+        path = _resolve_image_path(src)
+        key = str(path)
+        if path.exists() and key not in seen:
+            paths.append(path)
+            seen.add(key)
+    return paths
+
+
 def _resolve_image_path(src: str) -> Path:
     src = src.strip().lstrip("./")
     return Path(src).resolve()
+
+
+def show_image(image: Any, caption: Optional[str] = None):
+    try:
+        st.image(image, caption=caption, use_container_width=True)
+    except TypeError as exc:
+        if "use_container_width" not in str(exc):
+            raise
+        st.image(image, caption=caption, use_column_width=True)
 
 
 def render_markdown_with_local_images(md: str):
@@ -145,11 +340,11 @@ def render_markdown_with_local_images(md: str):
                     parts[i + 1] = ("md", rest)
 
         if src.startswith("http://") or src.startswith("https://"):
-            st.image(src, caption=caption or (alt or None), use_container_width=True)
+            show_image(src, caption=caption or (alt or None))
         else:
             img_path = _resolve_image_path(src)
             if img_path.exists():
-                st.image(str(img_path), caption=caption or (alt or None), use_container_width=True)
+                show_image(str(img_path), caption=caption or (alt or None))
             else:
                 st.warning(f"Image not found: `{src}` (looked for `{img_path}`)")
 
@@ -165,13 +360,88 @@ def list_past_blogs() -> List[Path]:
     Filters out obvious non-blog markdown files if needed.
     """
     cwd = Path(".")
-    files = [p for p in cwd.glob("*.md") if p.is_file()]
+    excluded = {"readme.md"}
+    files = [p for p in cwd.glob("*.md") if p.is_file() and p.name.lower() not in excluded]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files
 
 
 def read_md_file(p: Path) -> str:
     return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _is_safe_blog_path(p: Path) -> bool:
+    try:
+        cwd = Path(".").resolve()
+        target = p.resolve()
+        return target.parent == cwd and target.suffix.lower() == ".md" and target.name.lower() != "readme.md"
+    except Exception:
+        return False
+
+
+def _remove_empty_image_parents(paths: List[Path]) -> None:
+    images_root = (Path(".") / "images").resolve()
+    for path in paths:
+        parent = path.parent
+        while parent != images_root and images_root in parent.parents:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+
+def delete_blog_file(blog_file: Path) -> Tuple[bool, str]:
+    if not _is_safe_blog_path(blog_file):
+        return False, "Selected file is not a safe generated blog file."
+
+    try:
+        md_text = read_md_file(blog_file)
+    except FileNotFoundError:
+        return False, "Selected blog file no longer exists."
+    except Exception as exc:
+        return False, f"Could not read selected blog: {exc}"
+
+    blog_slug = blog_file.stem
+    images_root = (Path(".") / "images").resolve()
+    related_image_dir = (Path("images") / blog_slug).resolve()
+    deleted_images = 0
+
+    try:
+        if related_image_dir.exists() and related_image_dir.is_dir() and images_root in related_image_dir.parents:
+            for p in sorted(related_image_dir.rglob("*"), reverse=True):
+                if p.is_file():
+                    p.unlink()
+                    deleted_images += 1
+                elif p.is_dir():
+                    p.rmdir()
+            related_image_dir.rmdir()
+        else:
+            image_paths = [
+                p for p in image_paths_from_markdown(md_text)
+                if images_root in p.parents and p.parent.name == blog_slug
+            ]
+            for image_path in image_paths:
+                if image_path.exists():
+                    image_path.unlink()
+                    deleted_images += 1
+            _remove_empty_image_parents(image_paths)
+
+        blog_file.unlink()
+    except Exception as exc:
+        return False, f"Could not delete selected blog: {exc}"
+
+    detail = f"Deleted {blog_file.name}"
+    if deleted_images:
+        detail += f" and {deleted_images} related image file(s)"
+    return True, detail + "."
+
+
+def rerun_app() -> None:
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
 
 def extract_title_from_md(md: str, fallback: str) -> str:
@@ -434,6 +704,21 @@ with st.sidebar:
                 }
                 # also update the topic input to the title (best-effort) without changing UI
                 st.session_state["topic_prefill"] = extract_title_from_md(md_text, selected_md_file.stem)
+                st.session_state["loaded_blog_path"] = str(selected_md_file.resolve())
+
+        confirm_delete = st.checkbox("Confirm delete", key="confirm_delete_blog")
+        if st.button("Delete Selected Blog", type="secondary", use_container_width=True, disabled=not confirm_delete):
+            if selected_md_file:
+                deleted_loaded_blog = st.session_state.get("loaded_blog_path") == str(selected_md_file.resolve())
+                ok, message = delete_blog_file(selected_md_file)
+                if ok:
+                    if deleted_loaded_blog:
+                        st.session_state["last_out"] = None
+                        st.session_state.pop("loaded_blog_path", None)
+                    st.success(message)
+                    rerun_app()
+                else:
+                    st.error(message)
 
     
 
@@ -461,6 +746,41 @@ def log(msg: str):
 def friendly_error_message(exc: Exception) -> str:
     msg = str(exc)
     lowered = msg.lower()
+    if "owl alpha" in lowered or "owl_alpha" in lowered or "openrouter" in lowered:
+        if "api key expired" in lowered or "api key not valid" in lowered or "invalid api key" in lowered or "401" in msg:
+            return (
+                "OpenRouter/Owl Alpha API key is invalid or unauthorized. Check OWL_ALPHA_API_KEY "
+                "in .env, then restart Streamlit."
+            )
+        if "connection error" in lowered or "connection" in lowered or "timed out" in lowered:
+            return (
+                "OpenRouter/Owl Alpha connection failed while generating text. Your key/model are configured, "
+                "so this is usually a temporary network/provider issue. Retry the generation in a moment."
+            )
+        if "429" in msg or "quota" in lowered or "rate limit" in lowered:
+            return (
+                "OpenRouter/Owl Alpha quota or rate limit was reached. Wait for quota reset "
+                "or use another OpenRouter key."
+            )
+        if "402" in msg or "payment required" in lowered or "credits" in lowered:
+            return (
+                "OpenRouter says credits or billing are required for this request. Check the "
+                "OpenRouter account tied to the configured key."
+            )
+    if ("grok" in lowered or "xai" in lowered) and (
+        "api key expired" in lowered or "api key not valid" in lowered or "invalid api key" in lowered
+    ):
+        return (
+            "Grok/xAI API key is expired or invalid. The app is running, but Grok cannot "
+            "generate text until you renew the key or add another valid provider key."
+        )
+    if ("grok" in lowered or "xai" in lowered) and (
+        "429" in msg or "quota" in lowered or "rate limit" in lowered
+    ):
+        return (
+            "Grok/xAI quota or rate limit was reached. The app is running, but Grok cannot "
+            "generate more text right now. Wait for quota reset, enable billing, or add another provider key."
+        )
     if "api key expired" in lowered or "api key not valid" in lowered or "invalid api key" in lowered:
         return (
             "Google API key is expired or invalid. The app is running, but Gemini cannot "
@@ -649,7 +969,17 @@ if out:
                 mime="text/markdown",
             )
 
-            bundle = bundle_zip(final_md, md_filename, Path("images"))
+            pdf = markdown_to_pdf_bytes(final_md)
+            st.download_button(
+                "Download PDF",
+                data=pdf,
+                file_name=f"{safe_slug(blog_title)}.pdf",
+                mime="application/pdf",
+            )
+
+            image_paths = image_paths_from_markdown(final_md)
+            bundle_root = image_paths[0].parent if image_paths else Path("images")
+            bundle = bundle_zip(final_md, md_filename, bundle_root)
             st.download_button(
                 "Download Bundle (MD + images)",
                 data=bundle,
@@ -661,24 +991,21 @@ if out:
     with tab_images:
         st.subheader("Images")
         specs = out.get("image_specs") or []
-        images_dir = Path("images")
+        final_md_for_images = out.get("final") or ""
+        current_images = image_paths_from_markdown(final_md_for_images)
 
-        if not specs and not images_dir.exists():
+        if not specs and not current_images:
             st.info("No images generated for this blog.")
         else:
             if specs:
                 st.write("**Image plan:**")
                 st.json(specs)
 
-            if images_dir.exists():
-                files = [p for p in images_dir.iterdir() if p.is_file()]
-                if not files:
-                    st.warning("images/ exists but is empty.")
-                else:
-                    for p in sorted(files):
-                        st.image(str(p), caption=p.name, use_container_width=True)
+            if current_images:
+                for p in current_images:
+                    show_image(str(p), caption=p.name)
 
-                z = images_zip(images_dir)
+                z = images_zip(current_images[0].parent)
                 if z:
                     st.download_button(
                         "Download Images (zip)",

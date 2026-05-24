@@ -9,6 +9,8 @@ streamlit.*.log
 *.out.log
 *.err.log
 
-# GitHub
-.venv/
+# Generated blog outputs
+images/
+create_a_blog*.md
+*_explained.md
 
