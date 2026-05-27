@@ -684,7 +684,8 @@ if out:
         task_count = 0
 
     stats_cols = st.columns(4)
-    stats_cols[0].metric("Words", f"{len(re.findall(r'\b\w+\b', final_md_stats)):,}")
+    word_count = len(re.findall(r'\b\w+\b', final_md_stats))
+    stats_cols[0].metric("Words", f"{word_count:,}")
     
     sections_count = len(out.get("sections") or [])
     if sections_count == 0 and final_md_stats:
