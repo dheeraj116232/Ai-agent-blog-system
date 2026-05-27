@@ -13,4 +13,6 @@ streamlit.*.log
 images/
 create_a_blog*.md
 *_explained.md
+blogs.db
+*.db
 

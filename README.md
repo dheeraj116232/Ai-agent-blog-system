@@ -20,10 +20,11 @@ The app uses LangGraph to route each generation through planning, optional web r
 - Streamlit for the web interface
 - LangGraph for the generation workflow
 - Pydantic for structured data validation
-- OpenRouter Owl Alpha for text generation
-- OpenRouter Grok image model for image generation
+- AWS Bedrock (Claude) for text generation (via `AWS_BEARER_TOKEN_BEDROCK`)
+- Image generation: existing providers (Grok/Gemini/OpenAI). Eden can be wired later via `EDEN_API_KEY`.
 - Tavily for optional web research
 - Pillow for PDF export
+
 
 ## Project Structure
 
@@ -87,19 +88,22 @@ http://localhost:8501
 
 ### Text Generation
 
-Recommended text provider:
+Recommended text provider (Bedrock):
 
 ```text
-TEXT_MODEL_PROVIDER=owl_alpha
-OWL_ALPHA_API_KEY=sk-or-v1-...
-OWL_ALPHA_MODEL=openrouter/owl-alpha
+TEXT_MODEL_PROVIDER=bedrock
+AWS_BEARER_TOKEN_BEDROCK=...
+AWS_REGION_BEDROCK=ap-south-1
+BEDROCK_TEXT_MODEL_ID=anthropic.claude-opus-4-7
 ```
+
 
 `OPENROUTER_API_KEY` is also supported as a fallback for Owl Alpha.
 
 Supported text provider values include:
 
 ```text
+bedrock
 owl_alpha
 grok
 gemini
@@ -108,11 +112,8 @@ local
 auto
 ```
 
-When `TEXT_MODEL_PROVIDER=auto`, the backend tries configured providers in this order:
+When `TEXT_MODEL_PROVIDER=auto`, the backend tries configured providers. If `AWS_BEARER_TOKEN_BEDROCK` is set, Bedrock is preferred.
 
-```text
-Owl Alpha/OpenRouter -> Grok/xAI -> Gemini -> OpenAI -> local
-```
 
 ### Image Generation
 
