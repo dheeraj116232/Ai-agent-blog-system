@@ -208,6 +208,8 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
 OPENROUTER_APP_TITLE = os.getenv("OPENROUTER_APP_TITLE", "AI Blog Agent")
 OWL_ALPHA_MODEL = os.getenv("OWL_ALPHA_MODEL", "openrouter/owl-alpha")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+GROQ_TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")).strip()
 GROK_MODEL = os.getenv("GROK_MODEL", os.getenv("XAI_MODEL", "grok-4.3"))
 GROK_BASE_URL = os.getenv("GROK_BASE_URL", os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")).rstrip("/")
 GROK_IMAGE_MODEL = os.getenv("GROK_IMAGE_MODEL", os.getenv("XAI_GROK_IMAGE_MODEL", "x-ai/grok-imagine-image-quality"))
@@ -403,6 +405,13 @@ def _env_first(*names: str) -> Optional[str]:
     return None
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
 def _looks_like_openrouter_key(api_key: str) -> bool:
     return api_key.startswith("sk-or-")
 
@@ -482,6 +491,10 @@ def _grok_api_key() -> Optional[str]:
     return os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY")
 
 
+def _groq_api_key() -> Optional[str]:
+    return os.getenv("GROQ_API_KEY")
+
+
 def _extract_openai_response_text(response) -> str:
     output_text = getattr(response, "output_text", None)
     if output_text:
@@ -541,6 +554,49 @@ def _grok_text(prompt: str) -> str:
         errors.append(f"chat completions API: {exc}")
 
     raise RuntimeError("Grok API request failed. " + " | ".join(errors))
+
+
+def _groq_text(prompt: str) -> str:
+    api_key = _groq_api_key()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not set for Groq text generation.")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "Groq support requires the openai package. Install it with pip install openai."
+        ) from exc
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url=GROQ_BASE_URL,
+        timeout=90,
+        max_retries=2,
+    )
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, 5):
+        try:
+            response = client.chat.completions.create(
+                model=GROQ_TEXT_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=1200,
+            )
+            text = response.choices[0].message.content
+            if not text:
+                raise RuntimeError(f"Groq response did not include text: {response}")
+            return text.strip()
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code and status_code not in {408, 409, 429} and status_code < 500:
+                raise
+            last_error = exc
+            if attempt < 4:
+                time.sleep(1.5 * attempt)
+
+    raise RuntimeError(f"Groq request failed after retries: {last_error}")
 
 
 def _openai_text(prompt: str) -> str:
@@ -652,6 +708,8 @@ def _get_text_provider_order() -> List[str]:
         return ["bedrock"]
     if TEXT_MODEL_PROVIDER in ("owl", "owl-alpha", "owl_alpha", "openrouter", "openrouter_owl"):
         return ["owl_alpha"]
+    if TEXT_MODEL_PROVIDER in ("groq", "groqcloud"):
+        return ["groq"]
     if TEXT_MODEL_PROVIDER in ("grok", "xai"):
         return ["grok"]
     if TEXT_MODEL_PROVIDER in ("gemini", "openai", "local"):
@@ -659,6 +717,8 @@ def _get_text_provider_order() -> List[str]:
 
     # Auto-mode or default ordering
     order: List[str] = []
+    if _groq_api_key():
+        order.append("groq")
     if _owl_alpha_api_key():
         order.append("owl_alpha")
     if os.getenv("GOOGLE_API_KEY") or os.getenv("Google_API_KEY"):
@@ -684,6 +744,8 @@ def run_text_model(prompt: str) -> str:
                 return _bedrock_text(prompt)
             if provider == "grok":
                 return _grok_text(prompt)
+            if provider == "groq":
+                return _groq_text(prompt)
             if provider == "gemini":
                 return _gemini_text(prompt)
             if provider == "openai":
@@ -698,6 +760,10 @@ def run_text_model(prompt: str) -> str:
     raise RuntimeError(
         "All text providers failed.\n" + "\n".join(errors)
     )
+
+
+def _is_groq_text_mode() -> bool:
+    return _get_text_provider_order()[0] == "groq"
 
 # -----------------------------
 # 3) Router
@@ -808,6 +874,34 @@ def _raw_results_to_evidence(raw: List[dict]) -> List[EvidenceItem]:
     return _dedupe_evidence(evidence)
 
 
+def _compact_raw_results_for_prompt(raw: List[dict], limit: int, snippet_chars: int) -> List[dict]:
+    compact: List[dict] = []
+    for result in raw[:limit]:
+        compact.append(
+            {
+                "title": (result.get("title") or "").strip(),
+                "url": (result.get("url") or "").strip(),
+                "published_at": result.get("published_at") or result.get("published_date"),
+                "source": result.get("source"),
+                "snippet": (result.get("snippet") or result.get("content") or "")[:snippet_chars],
+            }
+        )
+    return compact
+
+
+def _compact_evidence_for_prompt(evidence: List[EvidenceItem], limit: int, snippet_chars: int) -> List[dict]:
+    return [
+        {
+            "title": item.title,
+            "url": item.url,
+            "published_at": item.published_at,
+            "source": item.source,
+            "snippet": (item.snippet or "")[:snippet_chars],
+        }
+        for item in evidence[:limit]
+    ]
+
+
 def _filter_evidence_for_mode(state: State, evidence: List[EvidenceItem]) -> List[EvidenceItem]:
     if state.get("mode") != "open_book":
         return evidence
@@ -829,20 +923,28 @@ Rules:
 """
 
 def research_node(state: State) -> dict:
-    queries = (state.get("queries") or [])[:10]
+    groq_mode = _is_groq_text_mode()
+    max_queries = _env_positive_int("GROQ_RESEARCH_MAX_QUERIES", 4) if groq_mode else 10
+    max_results = _env_positive_int("GROQ_RESEARCH_MAX_RESULTS", 3) if groq_mode else 6
+    queries = (state.get("queries") or [])[:max_queries]
     raw: List[dict] = []
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        raw.extend(_tavily_search(q, max_results=max_results))
 
     if not raw:
         return {"evidence": []}
 
     fallback_evidence = _raw_results_to_evidence(raw)
+    prompt_raw = (
+        _compact_raw_results_for_prompt(raw, max_queries * max_results, 220)
+        if groq_mode
+        else raw
+    )
     prompt = (
         f"{RESEARCH_SYSTEM}\n\n"
         f"As-of date: {state['as_of']}\n"
         f"Recency days: {state['recency_days']}\n\n"
-        f"Raw results:\n{raw}\n"
+        f"Raw results:\n{prompt_raw}\n"
         "Return only valid JSON with a top-level key named evidence, where evidence is a list of objects with title, url, published_at, snippet, and source."
     )
     try:
@@ -881,6 +983,12 @@ def orchestrator_node(state: State) -> dict:
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
     forced_kind = "news_roundup" if mode == "open_book" else None
+    groq_mode = _is_groq_text_mode()
+    evidence_for_prompt = _compact_evidence_for_prompt(
+        evidence,
+        limit=_env_positive_int("GROQ_PLAN_EVIDENCE_ITEMS", 8) if groq_mode else 16,
+        snippet_chars=220 if groq_mode else 500,
+    )
 
     prompt = (
         f"{ORCH_SYSTEM}\n\n"
@@ -888,7 +996,7 @@ def orchestrator_node(state: State) -> dict:
         f"Mode: {mode}\n"
         f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
         f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-        f"Evidence:\n{[e.model_dump() for e in evidence][:16]}\n"
+        f"Evidence:\n{evidence_for_prompt}\n"
         "Return only valid JSON matching the Plan schema."
     )
     raw_response = run_text_model(prompt)
@@ -951,11 +1059,14 @@ Code:
 - If requires_code==true, include at least one minimal snippet.
 
 Diagrams:
-- If a flowchart, sequence diagram, or architectural diagram would help explain a concept, structure, or process, generate it inline inside a standard Mermaid diagram block:
+- If this section explains a workflow, architecture, roadmap, comparison, or step-by-step process, include one concise Mermaid diagram block.
+- Use only simple Mermaid syntax that renders reliably: graph TD, graph LR, flowchart TD, or sequenceDiagram.
+- Output Mermaid directly as a fenced code block:
   ```mermaid
   graph TD
       A[Start] --> B(Process)
   ```
+- Do not describe a diagram as a prompt. Actually write the Mermaid code block.
 """
 
 def worker_node(payload: dict) -> dict:
@@ -967,9 +1078,15 @@ def worker_node(payload: dict) -> dict:
     evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
 
     bullets_text = "\n- " + "\n- ".join(task.bullets)
+    evidence_limit = _env_positive_int("GROQ_WORKER_EVIDENCE_ITEMS", 8) if _is_groq_text_mode() else 20
     evidence_text = "\n".join(
         f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}"
-        for e in evidence[:20]
+        for e in evidence[:evidence_limit]
+    )
+    diagram_hint = (
+        "This is the opening section. Include one compact Mermaid roadmap diagram for the blog."
+        if task.id == 1
+        else "Include a Mermaid diagram only if it helps this section explain a flow, architecture, or process."
     )
 
     prompt = (
@@ -989,6 +1106,7 @@ def worker_node(payload: dict) -> dict:
         f"requires_research: {task.requires_research}\n"
         f"requires_citations: {task.requires_citations}\n"
         f"requires_code: {task.requires_code}\n"
+        f"Diagram guidance: {diagram_hint}\n"
         f"Bullets:{bullets_text}\n\n"
         f"Evidence (ONLY cite these URLs):\n{evidence_text}\n"
     )
@@ -1007,27 +1125,67 @@ def _safe_slug(title: str) -> str:
     return s or "blog"
 
 
-def _convert_mermaid_to_images(md_content: str) -> str:
-    import base64
-    import re
-    
-    # Pattern to match ```mermaid ... ``` code blocks
-    pattern = r"```mermaid\s*\n(.*?)\n```"
-    
+def _mermaid_image_url(code: str) -> str:
+    encoded = base64.urlsafe_b64encode(code.encode("utf-8")).decode("ascii")
+    return f"https://mermaid.ink/svg/{encoded}"
+
+
+def _mermaid_image_markdown(code: str, title: str = "Mermaid Diagram") -> str:
+    return f"![{title}]({_mermaid_image_url(code)})\n\n*(Generated diagram for the blog structure/flow)*"
+
+
+def _convert_mermaid_to_images(md_content: str) -> tuple[str, int]:
+    # Match fenced Mermaid blocks with Windows or Unix line endings.
+    pattern = r"```\s*mermaid\s*\r?\n(.*?)\r?\n```"
+    converted_count = 0
+
     def replacer(match):
+        nonlocal converted_count
         code = match.group(1).strip()
         try:
-            # Base64 encode the mermaid code
-            code_bytes = code.encode("utf-8")
-            base64_bytes = base64.b64encode(code_bytes)
-            base64_string = base64_bytes.decode("ascii")
-            url = f"https://mermaid.ink/img/{base64_string}"
-            return f"![Mermaid Diagram]({url})\n\n*(Visual diagram representing the architecture/flow)*"
+            converted_count += 1
+            return _mermaid_image_markdown(code)
         except Exception as exc:
             logger.warning("Failed to encode Mermaid code block: %s", exc)
-            return match.group(0) # Keep original block if it fails
-            
-    return re.sub(pattern, replacer, md_content, flags=re.DOTALL)
+            return match.group(0)
+
+    converted_md = re.sub(pattern, replacer, md_content, flags=re.DOTALL | re.IGNORECASE)
+    return converted_md, converted_count
+
+
+def _mermaid_label(text: str, max_chars: int = 38) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    cleaned = cleaned.replace("\\", "").replace('"', "'").replace("[", "(").replace("]", ")")
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 1].rstrip() + "..."
+    return cleaned or "Section"
+
+
+def _fallback_roadmap_diagram(plan: Plan) -> str:
+    tasks = plan.tasks[:7]
+    if not tasks:
+        return ""
+
+    lines = ["flowchart TD", f'    T["{_mermaid_label(plan.blog_title, 48)}"]']
+    previous = "T"
+    for index, task in enumerate(tasks, start=1):
+        node_id = f"S{index}"
+        lines.append(f'    {node_id}["{_mermaid_label(task.title)}"]')
+        lines.append(f"    {previous} --> {node_id}")
+        previous = node_id
+    return "\n".join(lines)
+
+
+def _insert_fallback_diagram(md_content: str, plan: Plan) -> str:
+    if "mermaid.ink/" in md_content or "```mermaid" in md_content.lower():
+        return md_content
+
+    diagram_code = _fallback_roadmap_diagram(plan)
+    if not diagram_code:
+        return md_content
+
+    diagram_md = f"## Blog Roadmap\n\n{_mermaid_image_markdown(diagram_code, 'Blog Roadmap Diagram')}\n\n"
+    return re.sub(r"^(# .+?\r?\n\r?\n)", rf"\1{diagram_md}", md_content, count=1, flags=re.DOTALL)
 
 
 def merge_content(state: State) -> dict:
@@ -1038,8 +1196,11 @@ def merge_content(state: State) -> dict:
     body = "\n\n".join(ordered_sections).strip()
     merged_md = f"# {plan.blog_title}\n\n{body}\n"
 
-    # Convert Mermaid code blocks to inline images
-    merged_md = _convert_mermaid_to_images(merged_md)
+    # Convert Mermaid code blocks to inline images. If the model skipped diagrams,
+    # insert a deterministic roadmap so every generated blog still has a visual.
+    merged_md, converted_diagrams = _convert_mermaid_to_images(merged_md)
+    if converted_diagrams == 0:
+        merged_md = _insert_fallback_diagram(merged_md, plan)
 
     blog_slug = _safe_slug(plan.blog_title)
     

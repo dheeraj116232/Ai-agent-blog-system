@@ -210,7 +210,9 @@ def try_stream(graph_app, inputs: Dict[str, Any]) -> Iterator[Tuple[str, Any]]:
     """
     latest_state: Dict[str, Any] = {}
     try:
-        for step in graph_app.stream(inputs, stream_mode="values"):
+        provider = os.getenv("TEXT_MODEL_PROVIDER", "").strip().lower()
+        config = {"max_concurrency": 1} if provider in {"groq", "groqcloud"} else None
+        for step in graph_app.stream(inputs, config=config, stream_mode="values"):
             if isinstance(step, dict):
                 latest_state = step
             yield ("values", step)
@@ -572,6 +574,22 @@ def friendly_error_message(exc: Exception) -> str:
             return (
                 "OpenRouter says credits or billing are required for this request. Check the "
                 "OpenRouter account tied to the configured key."
+            )
+    if "groq" in lowered:
+        if "api key expired" in lowered or "api key not valid" in lowered or "invalid api key" in lowered or "401" in msg:
+            return (
+                "Groq API key is invalid or unauthorized. Check GROQ_API_KEY in .env, "
+                "then restart Streamlit."
+            )
+        if "429" in msg or "quota" in lowered or "rate limit" in lowered:
+            return (
+                "Groq quota or rate limit was reached. Wait for quota reset, enable billing, "
+                "or use another provider key."
+            )
+        if "connection error" in lowered or "connection" in lowered or "timed out" in lowered:
+            return (
+                "Groq connection failed while generating text. This is usually temporary; "
+                "retry the generation in a moment."
             )
     if ("grok" in lowered or "xai" in lowered) and (
         "api key expired" in lowered or "api key not valid" in lowered or "invalid api key" in lowered
